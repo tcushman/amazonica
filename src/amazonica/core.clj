@@ -14,6 +14,7 @@
              DefaultAWSCredentialsProviderChain]
            [com.amazonaws.auth.profile
              ProfileCredentialsProvider]
+           com.amazonaws.handlers.AsyncHandler
            [com.amazonaws.regions
              Region
              Regions]
@@ -155,7 +156,7 @@
 
 (defn- create-client
   [aws-client credentials configuration]
-  (if (every? nil? [credentials configuration])
+  (if (and (nil? credentials) (nil? configuration))
     (new-instance aws-client)
     ; TransferManager is the only client to date that doesn't
     ; accept AWSCredentialsProviders
@@ -168,6 +169,12 @@
                                                  (filter (comp not nil?)
                                                          [credentials configuration]))))))
 
+(defn static-credentials-provider
+  [aws-credentials]
+  (reify AWSCredentialsProvider
+    (getCredentials [_] aws-credentials)
+    (refresh [_] nil)))
+
 (defn get-credentials
   [credentials]
   (cond
@@ -176,15 +183,17 @@
     credentials
     (and (associative? credentials)
          (contains? credentials :session-token))
-    (BasicSessionCredentials.
-        (:access-key credentials)
-        (:secret-key credentials)
-        (:session-token credentials))
+    (static-credentials-provider
+      (BasicSessionCredentials.
+          (:access-key credentials)
+          (:secret-key credentials)
+          (:session-token credentials)))
     (and (associative? credentials)
          (contains? credentials :access-key))
-    (BasicAWSCredentials.
-        (:access-key credentials)
-        (:secret-key credentials))
+    (static-credentials-provider
+      (BasicAWSCredentials.
+          (:access-key credentials)
+          (:secret-key credentials)))
     (and (associative? credentials)
          (contains? credentials :profile))
     (ProfileCredentialsProvider.
@@ -487,12 +496,12 @@
     (into-array
       ;; misbehaving S3Client mutates the coll
       (if (and (coll? v)
-            (= AmazonS3Client *client-class*))
+               (= AmazonS3Client *client-class*))
         (if (and (> (count (.getParameterTypes method)) 1)
                  (sequential? v))
           (to-java-coll v)
           [(to-java-coll v)])
-          [v])))
+        [v])))
   true)
 
 (declare set-fields)
@@ -573,7 +582,6 @@
   (-> (.getParameterTypes method)
       first
       (create-bean args)))
-
 
 (defprotocol IMarshall
   "Defines the contract for converting Java types to Clojure
@@ -661,6 +669,24 @@
         (get-fields obj)
         obj)))
 
+(defn- create-async-handler
+  "Create a reified instance of an AsyncHandler from
+a map of function"
+  [{:keys [on-success on-error handler catch]}]
+  (if (instance? AsyncHandler handler)
+    handler
+    (let [on-success (or on-success handler
+                       (throw (ex-info "No asynchronous handler provided" {})))
+          on-error   (or on-error catch
+                       (throw (ex-info "No asynchronous error handler provided" {})))]
+      (reify AsyncHandler
+        (onSuccess [_ request result]
+          (when (fn? on-success)
+            (on-success (marshall result))))
+        (onError [_ error]
+          (when (fn? on-error)
+            (on-error error)))))))
+
 (defn- use-aws-request-bean?
   [method args]
   (let [types (.getParameterTypes method)]
@@ -679,6 +705,49 @@
              (and (aws-package? (last types))
                   (not (< (count types) (count args))))))))
 
+(defn pred-matcher [vsym pred]
+  (cond (vector? pred)
+        (let [elems (count pred)
+              match-length `(= ~elems (count ~vsym))
+              position-syms (vec (repeatedly elems gensym))
+              conditions (remove true?
+                           (map pred-matcher position-syms pred))]
+          (if (empty? conditions)
+            match-length
+            `(when ~match-length
+               (let [~position-syms ~vsym]
+                 ~(cons `and conditions)))))
+
+        (sequential? pred)
+        (list* (first pred) vsym (rest pred))
+
+        (and (symbol? pred)
+             (= "_" (name pred))) true
+
+        :else (list pred vsym)))
+
+(defmacro match [val & matches]
+  (let [v (gensym "v")]
+    `(let [~v ~val]
+       (cond
+         ~@(mapcat (fn [pair]
+                     (if (= 1 (count pair))
+                       [:else (first pair)]
+                       (let [[pred action] pair]
+                         [(pred-matcher v pred) action])))
+             (partition-all 2 matches)))
+         )))
+
+(defn condense-key-pairs
+  ([args]
+    (condense-key-pairs nil args))
+  ([args-map remaining-args]
+    (if (and (<= 2 (count remaining-args))
+             (keyword? (first remaining-args)))
+      (let [[k v & more] remaining-args]
+        (recur (assoc args-map k v) more))
+      (cons args-map remaining-args))))
+
 (defn- prepare-args
   [method args]
   (let [types (.getParameterTypes method)
@@ -696,46 +765,50 @@
                (vec args)
                types))
         (if (use-aws-request-bean? method args)
-          (cond
-            (= 1 num)
+          (let [[bean-args & more-args] (condense-key-pairs args)]
             (into-array Object
-                        [(create-request-bean
-                            method
-                            (seq (apply hash-map args)))])
-            (and (aws-package? (first types))
-                 (= 2 num)
-                 (= File (last types)))
-            (into-array Object
-                        [(create-request-bean
-                            method
-                            (seq (apply hash-map (butlast args))))
-                         (last args)])))))))
+              (match types
+                [_]
+                [(create-request-bean method bean-args)]
 
+                [aws-package? (isa? File)]
+                [(create-request-bean method bean-args)
+                 (first more-args)]
+
+                [aws-package? (isa? AsyncHandler)]
+                [(create-request-bean method
+                   (dissoc bean-args :on-success :on-error :handler :catch))
+                 (create-async-handler bean-args)]
+
+                nil)
+              )))))))
 
 (defn- args-from
   "Function arguments take an optional first parameter map
   of AWS credentials. Addtional parameters are either a map,
   or seq of keys and values."
   [arg-seq]
-  (let [args (first arg-seq)]
+  (let [args (first arg-seq)
+        first-arg (first args)
+        first-arg-map (when (map? first-arg) first-arg)]
     (cond
-      (or (and (or (map? args)
-                   (map? (first args)))
-               (or (contains? (first args) :access-key)
-                   (contains? (first args) :endpoint)
-                   (contains? (first args) :profile)
-                   (contains? (first args) :client-config)))
-          (instance? AWSCredentialsProvider (first args))
-          (instance? AWSCredentials (first args)))
+      (or (and first-arg-map
+               (or (contains? first-arg-map :access-key)
+                   (contains? first-arg-map :endpoint)
+                   (contains? first-arg-map :profile)
+                   (contains? first-arg-map :client-config)))
+          (instance? AWSCredentialsProvider first-arg)
+          (instance? AWSCredentials first-arg))
       {:args (if (-> args rest first map?)
                  (mapcat identity (-> args rest args-from :args))
                  (rest args))
-       :credential (if (map? (first args))
-                       (dissoc (first args) :client-config)
-                       (first args))
-       :client-config (:client-config (first args))}
-      (map? (first args))
-      {:args (let [m (mapcat identity (first args))]
+       :credential (if first-arg-map
+                       (dissoc first-arg-map :client-config)
+                       first-arg)
+       :client-config (:client-config first-arg-map)}
+      first-arg-map
+      {:args (let [{:keys [on-success on-error handler]} first-arg-map
+                   m (mapcat identity first-arg-map)]
                (if (seq m) m {}))}
       :default {:args args})))
 
@@ -752,11 +825,11 @@
 
 (defn- candidate-client
   [clazz args]
-  (let [cred-bound (or *credentials* (:credential args))
+  (let [cred-bound (or (:credential args) *credentials*)
         credential (if (map? cred-bound)
                              (merge @credential cred-bound)
                              (or cred-bound @credential))
-        config-bound (or *client-config* (:client-config args))
+        config-bound (or (:client-config args) *client-config*)
         client-config (merge @client-config config-bound)
         crypto (if (even? (count (:args args)))
                    (:encryption (apply hash-map (:args args))))
@@ -767,7 +840,6 @@
         (if (= clazz TransferManager)
             (transfer-manager credential client-config crypto)
             @client)))
-        
 
 (defn- fn-call
   "Returns a function that reflectively invokes method on
@@ -815,6 +887,12 @@
                 :else 3)))
           possible))))
 
+(defn- choose-async [possible args]
+  (when (some #{:on-success :on-error :handler :catch} args)
+    (first
+      (filter #(isa? (last (seq (.getParameterTypes %))) AsyncHandler)
+        possible))))
+
 (defn possible-methods
   [methods args]
   (filter
@@ -839,7 +917,9 @@
   (let [args (:args (args-from arg))
         methods (filter #(not (Modifier/isPrivate (.getModifiers %))) methods)]
     (or (some (partial types-match-args args) methods)
-        (choose-from (possible-methods methods args)))))
+        (let [methods (possible-methods methods args)]
+          (or (choose-async methods args)
+              (choose-from methods))))))
 
 (defn intern-function
   "Interns into ns, the symbol mapped to a Clojure function
